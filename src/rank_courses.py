@@ -139,6 +139,9 @@ def main():
 if str(data_path).lower().endswith((".xlsx", ".xls")):
     df = pd.read_excel(data_path)
 else:
+    if str(data_path).lower().endswith((".xlsx", ".xls")):
+    df = pd.read_excel(data_path)
+else:
     df = pd.read_csv(data_path)
     
     # First try long-form detection
