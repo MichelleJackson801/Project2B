@@ -7,7 +7,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
-# --- Heuristics to exclude non-rating columns by name ---
 EXCLUDE_NAME_PATTERNS = [
     r"timestamp", r"time", r"date",
     r"email", r"name",
@@ -22,13 +21,9 @@ def looks_excluded(col: str) -> bool:
 
 def infer_rating_columns(df: pd.DataFrame, min_nonnull: int = 10) -> list[str]:
     """
-    Pick columns that look like Likert/ratings:
-    - Mostly numeric after coercion
-    - Reasonable bounded scale (1–5, 1–7, 0–10, etc.)
-    - Enough non-null responses
+    Detect rating-like columns (numeric Likert scales).
     """
     candidates: list[str] = []
-
     for col in df.columns:
         if looks_excluded(col):
             continue
@@ -60,8 +55,7 @@ def infer_rating_columns(df: pd.DataFrame, min_nonnull: int = 10) -> list[str]:
 
 def rank_items_wide(df: pd.DataFrame, rating_cols: list[str]) -> pd.DataFrame:
     """
-    Treat each rating column as an item (program/course) and compute mean, n, std.
-    Rank by mean desc; tie-breaker by n desc.
+    Each rating column is an item (program/course). Rank by average rating.
     """
     rows = []
     for col in rating_cols:
@@ -85,9 +79,8 @@ def rank_items_wide(df: pd.DataFrame, rating_cols: list[str]) -> pd.DataFrame:
 
 def rank_items_long(df: pd.DataFrame) -> pd.DataFrame | None:
     """
-    If dataset is long-form with obvious columns like:
-      program/course/item/class  +  rating/score/preference
-    then rank those items.
+    If the dataset is long-form with columns like:
+    program/course/item/class AND rating/score/preference, use that.
     """
     cols = {str(c).lower().strip(): c for c in df.columns}
     possible_item = None
@@ -122,7 +115,7 @@ def rank_items_long(df: pd.DataFrame) -> pd.DataFrame | None:
 
 def plot_rankings(ranks: pd.DataFrame, outpath: Path, top_n: int = 20) -> None:
     top = ranks.head(top_n).copy()
-    top = top.sort_values("mean_rating", ascending=True)  # horizontal bar from low->high
+    top = top.sort_values("mean_rating", ascending=True)
 
     plt.figure(figsize=(10, max(6, 0.35 * len(top))))
     plt.barh(top["item"], top["mean_rating"])
@@ -151,9 +144,7 @@ def main() -> None:
         rating_cols = infer_rating_columns(df, min_nonnull=int(os.getenv("MIN_NONNULL", "10")))
         if not rating_cols:
             raise ValueError(
-                "No rating columns detected.\n"
-                "If your survey stores ratings as text (e.g., 'Strongly agree'), we can map those to numbers.\n"
-                "Otherwise, confirm the rating columns are numeric-like."
+                "No rating columns detected. If ratings are text (e.g., Strongly Agree), we can map them to numbers."
             )
         ranks = rank_items_wide(df, rating_cols)
 
@@ -161,7 +152,7 @@ def main() -> None:
     ranks.to_csv(outputs_dir / "rank_table.csv", index=False)
     plot_rankings(ranks, outputs_dir / "rank_order.png", top_n=int(os.getenv("TOP_N", "20")))
 
-    # Create a reflection template (YOU must write your own reflection)
+    # Reflection template (YOU must write your own reflection)
     reflection_path = outputs_dir / "reflection.md"
     if not reflection_path.exists():
         reflection_path.write_text(
