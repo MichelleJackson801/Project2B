@@ -24,8 +24,7 @@ jobs:
 
       - name: Run ranking script
         env:
-          DATA_PATH: data/exit_survey_2024.csv
-          TOP_N: "20"
+DATA_PATH: data/Grad Program Exit Survey Data 2024.xlsx          TOP_N: "20"
           MIN_NONNULL: "10"
         run: |
           python src/rank_courses.py
