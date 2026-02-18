@@ -17,35 +17,34 @@ EXCLUDE_NAME_PATTERNS = [
 ]
 
 def looks_excluded(col: str) -> bool:
-    c = col.strip().lower()
+    c = str(col).strip().lower()
     return any(re.search(p, c) for p in EXCLUDE_NAME_PATTERNS)
 
-def infer_rating_columns(df: pd.DataFrame, min_nonnull: int = 10):
+def infer_rating_columns(df: pd.DataFrame, min_nonnull: int = 10) -> list[str]:
     """
-    Pick columns that look like Likert ratings:
+    Pick columns that look like Likert/ratings:
     - Mostly numeric after coercion
     - Reasonable bounded scale (1–5, 1–7, 0–10, etc.)
-    - Enough responses
+    - Enough non-null responses
     """
-    candidates = []
+    candidates: list[str] = []
+
     for col in df.columns:
         if looks_excluded(col):
             continue
 
         s = pd.to_numeric(df[col], errors="coerce")
-        nonnull = s.notna().sum()
+        nonnull = int(s.notna().sum())
         if nonnull < min_nonnull:
             continue
 
-        # Must be "mostly numeric" among non-null entries
-        # (after coercion we only see numeric)
         unique_vals = s.dropna().unique()
         if len(unique_vals) < 2:
             continue
 
-        vmin, vmax = float(np.nanmin(s)), float(np.nanmax(s))
+        vmin = float(np.nanmin(s))
+        vmax = float(np.nanmax(s))
 
-        # Common rating bounds (allow a bit of slack)
         plausible = (
             (0 <= vmin and vmax <= 10) or
             (1 <= vmin and vmax <= 7) or
@@ -61,35 +60,36 @@ def infer_rating_columns(df: pd.DataFrame, min_nonnull: int = 10):
 
 def rank_items_wide(df: pd.DataFrame, rating_cols: list[str]) -> pd.DataFrame:
     """
-    Treat each rating column as an "item" (program/course) and compute:
-    - mean rating
-    - count
-    - std dev
-    Then rank by mean desc (ties broken by count desc).
+    Treat each rating column as an item (program/course) and compute mean, n, std.
+    Rank by mean desc; tie-breaker by n desc.
     """
     rows = []
     for col in rating_cols:
-        s = pd.to_numeric(df[col], errors="coerce")
-        s = s.dropna()
+        s = pd.to_numeric(df[col], errors="coerce").dropna()
+        if len(s) == 0:
+            continue
         rows.append({
             "item": col,
-            "mean_rating": s.mean() if len(s) else np.nan,
+            "mean_rating": float(s.mean()),
             "n_responses": int(len(s)),
-            "std_dev": s.std(ddof=1) if len(s) > 1 else np.nan,
+            "std_dev": float(s.std(ddof=1)) if len(s) > 1 else np.nan,
         })
 
-    out = pd.DataFrame(rows).dropna(subset=["mean_rating"])
+    out = pd.DataFrame(rows)
+    if out.empty:
+        raise ValueError("No usable rating columns after cleaning.")
+
     out = out.sort_values(["mean_rating", "n_responses"], ascending=[False, False]).reset_index(drop=True)
     out["rank"] = np.arange(1, len(out) + 1)
     return out[["rank", "item", "mean_rating", "n_responses", "std_dev"]]
 
 def rank_items_long(df: pd.DataFrame) -> pd.DataFrame | None:
     """
-    If dataset is already long-form with obvious columns like:
-      program/course/item + rating/score
-    we can detect and use that instead of wide-form inference.
+    If dataset is long-form with obvious columns like:
+      program/course/item/class  +  rating/score/preference
+    then rank those items.
     """
-    cols = {c.lower().strip(): c for c in df.columns}
+    cols = {str(c).lower().strip(): c for c in df.columns}
     possible_item = None
     possible_rating = None
 
@@ -106,6 +106,9 @@ def rank_items_long(df: pd.DataFrame) -> pd.DataFrame | None:
     temp[possible_rating] = pd.to_numeric(temp[possible_rating], errors="coerce")
     temp = temp.dropna(subset=[possible_item, possible_rating])
 
+    if temp.empty:
+        return None
+
     grouped = temp.groupby(possible_item)[possible_rating].agg(["mean", "count", "std"]).reset_index()
     grouped = grouped.rename(columns={
         possible_item: "item",
@@ -117,9 +120,9 @@ def rank_items_long(df: pd.DataFrame) -> pd.DataFrame | None:
     grouped["rank"] = np.arange(1, len(grouped) + 1)
     return grouped[["rank", "item", "mean_rating", "n_responses", "std_dev"]]
 
-def plot_rankings(ranks: pd.DataFrame, outpath: Path, top_n: int = 20):
+def plot_rankings(ranks: pd.DataFrame, outpath: Path, top_n: int = 20) -> None:
     top = ranks.head(top_n).copy()
-    top = top.sort_values("mean_rating", ascending=True)  # for horizontal bar chart
+    top = top.sort_values("mean_rating", ascending=True)  # horizontal bar from low->high
 
     plt.figure(figsize=(10, max(6, 0.35 * len(top))))
     plt.barh(top["item"], top["mean_rating"])
@@ -130,41 +133,35 @@ def plot_rankings(ranks: pd.DataFrame, outpath: Path, top_n: int = 20):
     plt.savefig(outpath, dpi=200)
     plt.close()
 
-def main():
+def main() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     data_path = os.getenv("DATA_PATH", str(repo_root / "data" / "exit_survey_202X.csv"))
     outputs_dir = repo_root / "outputs"
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
-if str(data_path).lower().endswith((".xlsx", ".xls")):
-    df = pd.read_excel(data_path)
-else:
+    # Read Excel or CSV
     if str(data_path).lower().endswith((".xlsx", ".xls")):
-    df = pd.read_excel(data_path)
-else:
-    df = pd.read_csv(data_path)
-    
-    # First try long-form detection
-    ranks = rank_items_long(df)
+        df = pd.read_excel(data_path)
+    else:
+        df = pd.read_csv(data_path)
 
-    # If not long-form, infer rating columns in wide format
+    # Rank
+    ranks = rank_items_long(df)
     if ranks is None:
         rating_cols = infer_rating_columns(df, min_nonnull=int(os.getenv("MIN_NONNULL", "10")))
         if not rating_cols:
             raise ValueError(
-                "No rating columns detected. "
-                "Rename columns to include Program/Course + Rating, OR ensure Likert columns are numeric-like."
+                "No rating columns detected.\n"
+                "If your survey stores ratings as text (e.g., 'Strongly agree'), we can map those to numbers.\n"
+                "Otherwise, confirm the rating columns are numeric-like."
             )
         ranks = rank_items_wide(df, rating_cols)
 
-    # Save table
+    # Save outputs
     ranks.to_csv(outputs_dir / "rank_table.csv", index=False)
+    plot_rankings(ranks, outputs_dir / "rank_order.png", top_n=int(os.getenv("TOP_N", "20")))
 
-    # Save figure
-    top_n = int(os.getenv("TOP_N", "20"))
-    plot_rankings(ranks, outputs_dir / "rank_order.png", top_n=top_n)
-
-    # Optional: create a reflection template (YOU must edit this yourself if you use it)
+    # Create a reflection template (YOU must write your own reflection)
     reflection_path = outputs_dir / "reflection.md"
     if not reflection_path.exists():
         reflection_path.write_text(
