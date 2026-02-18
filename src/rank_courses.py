@@ -1,5 +1,4 @@
 import os
-import re
 from pathlib import Path
 
 import numpy as np
@@ -7,128 +6,100 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
-EXCLUDE_NAME_PATTERNS = [
-    r"timestamp", r"time", r"date",
-    r"email", r"name",
-    r"comment", r"open\s*ended", r"why", r"explain", r"feedback", r"suggest",
-    r"id$", r"uid", r"student",
-    r"demographic", r"gender", r"age",
-]
+CORE_RANK_PREFIX = "Please place each MAcc CORE course into rank order"
+ELECTIVE_RATE_PREFIX = "Rate ACC"
 
-def looks_excluded(col: str) -> bool:
-    c = str(col).strip().lower()
-    return any(re.search(p, c) for p in EXCLUDE_NAME_PATTERNS)
 
-def infer_rating_columns(df: pd.DataFrame, min_nonnull: int = 10) -> list[str]:
-    """
-    Detect rating-like columns (numeric Likert scales).
-    """
-    candidates: list[str] = []
-    for col in df.columns:
-        if looks_excluded(col):
-            continue
+def clean_course_name(col: str) -> str:
+    # Keep the part after the last " - "
+    parts = str(col).split(" - ")
+    return parts[-1].strip() if len(parts) > 1 else str(col).strip()
 
-        s = pd.to_numeric(df[col], errors="coerce")
-        nonnull = int(s.notna().sum())
-        if nonnull < min_nonnull:
-            continue
 
-        unique_vals = s.dropna().unique()
-        if len(unique_vals) < 2:
-            continue
+def find_core_rank_cols(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if CORE_RANK_PREFIX.lower() in str(c).lower()]
 
-        vmin = float(np.nanmin(s))
-        vmax = float(np.nanmax(s))
 
-        plausible = (
-            (0 <= vmin and vmax <= 10) or
-            (1 <= vmin and vmax <= 7) or
-            (1 <= vmin and vmax <= 5) or
-            (1 <= vmin and vmax <= 9)
+def find_elective_rate_cols(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if str(c).strip().startswith(ELECTIVE_RATE_PREFIX)]
+
+
+def rank_core_courses(df: pd.DataFrame) -> pd.DataFrame:
+    cols = find_core_rank_cols(df)
+    if not cols:
+        raise ValueError(
+            "No CORE rank-order columns found. Expected columns containing: "
+            "'Please place each MAcc CORE course into rank order'"
         )
-        if not plausible:
-            continue
 
-        candidates.append(col)
-
-    return candidates
-
-def rank_items_wide(df: pd.DataFrame, rating_cols: list[str]) -> pd.DataFrame:
-    """
-    Each rating column is an item (program/course). Rank by average rating.
-    """
     rows = []
-    for col in rating_cols:
+    for col in cols:
         s = pd.to_numeric(df[col], errors="coerce").dropna()
+        # CORE ranks are typically 1..8; keep a wide safety bound
+        s = s[(s >= 1) & (s <= 50)]
         if len(s) == 0:
             continue
         rows.append({
-            "item": col,
-            "mean_rating": float(s.mean()),
+            "course": clean_course_name(col),
+            "mean_rank": float(s.mean()),
             "n_responses": int(len(s)),
-            "std_dev": float(s.std(ddof=1)) if len(s) > 1 else np.nan,
         })
 
     out = pd.DataFrame(rows)
     if out.empty:
-        raise ValueError("No usable rating columns after cleaning.")
+        raise ValueError("CORE rank columns found, but no usable numeric rank values.")
 
+    # Lower mean rank = better (more beneficial)
+    out = out.sort_values(["mean_rank", "n_responses"], ascending=[True, False]).reset_index(drop=True)
+    out["rank"] = np.arange(1, len(out) + 1)
+    return out[["rank", "course", "mean_rank", "n_responses"]]
+
+
+def rank_electives(df: pd.DataFrame) -> pd.DataFrame:
+    cols = find_elective_rate_cols(df)
+    if not cols:
+        return pd.DataFrame(columns=["rank", "course", "mean_rating", "n_responses"])
+
+    rows = []
+    for col in cols:
+        s = pd.to_numeric(df[col], errors="coerce").dropna()
+        s = s[(s >= 1) & (s <= 5)]
+        if len(s) == 0:
+            continue
+        rows.append({
+            "course": clean_course_name(col),
+            "mean_rating": float(s.mean()),
+            "n_responses": int(len(s)),
+        })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame(columns=["rank", "course", "mean_rating", "n_responses"])
+
+    # Higher mean rating = better
     out = out.sort_values(["mean_rating", "n_responses"], ascending=[False, False]).reset_index(drop=True)
     out["rank"] = np.arange(1, len(out) + 1)
-    return out[["rank", "item", "mean_rating", "n_responses", "std_dev"]]
+    return out[["rank", "course", "mean_rating", "n_responses"]]
 
-def rank_items_long(df: pd.DataFrame) -> pd.DataFrame | None:
-    """
-    If the dataset is long-form with columns like:
-    program/course/item/class AND rating/score/preference, use that.
-    """
-    cols = {str(c).lower().strip(): c for c in df.columns}
-    possible_item = None
-    possible_rating = None
 
-    for k in cols:
-        if k in ["program", "course", "item", "class"]:
-            possible_item = cols[k]
-        if k in ["rating", "score", "preference"]:
-            possible_rating = cols[k]
-
-    if not possible_item or not possible_rating:
-        return None
-
-    temp = df[[possible_item, possible_rating]].copy()
-    temp[possible_rating] = pd.to_numeric(temp[possible_rating], errors="coerce")
-    temp = temp.dropna(subset=[possible_item, possible_rating])
-
-    if temp.empty:
-        return None
-
-    grouped = temp.groupby(possible_item)[possible_rating].agg(["mean", "count", "std"]).reset_index()
-    grouped = grouped.rename(columns={
-        possible_item: "item",
-        "mean": "mean_rating",
-        "count": "n_responses",
-        "std": "std_dev",
-    })
-    grouped = grouped.sort_values(["mean_rating", "n_responses"], ascending=[False, False]).reset_index(drop=True)
-    grouped["rank"] = np.arange(1, len(grouped) + 1)
-    return grouped[["rank", "item", "mean_rating", "n_responses", "std_dev"]]
-
-def plot_rankings(ranks: pd.DataFrame, outpath: Path, top_n: int = 20) -> None:
-    top = ranks.head(top_n).copy()
-    top = top.sort_values("mean_rating", ascending=True)
+def plot_core_rank(core_table: pd.DataFrame, outpath: Path, top_n: int = 20) -> None:
+    top = core_table.head(top_n).copy()
+    # For horizontal bar chart, reverse so best appears on top
+    top = top.sort_values("mean_rank", ascending=False)
 
     plt.figure(figsize=(10, max(6, 0.35 * len(top))))
-    plt.barh(top["item"], top["mean_rating"])
-    plt.xlabel("Average Rating")
-    plt.title(f"Rank-Ordered Programs/Courses (Top {min(top_n, len(ranks))})")
+    plt.barh(top["course"], top["mean_rank"])
+    plt.xlabel("Average Rank (lower = more beneficial)")
+    plt.title(f"MAcc CORE Courses: Rank Order (Top {min(top_n, len(core_table))})")
     plt.tight_layout()
     outpath.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(outpath, dpi=200)
     plt.close()
 
-def main() -> None:
+
+def main():
     repo_root = Path(__file__).resolve().parents[1]
-    data_path = os.getenv("DATA_PATH", str(repo_root / "data" / "exit_survey_202X.csv"))
+    data_path = os.getenv("DATA_PATH", str(repo_root / "data" / "Grad Program Exit Survey Data 2024.xlsx"))
     outputs_dir = repo_root / "outputs"
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -138,33 +109,19 @@ def main() -> None:
     else:
         df = pd.read_csv(data_path)
 
-    # Rank
-    ranks = rank_items_long(df)
-    if ranks is None:
-        rating_cols = infer_rating_columns(df, min_nonnull=int(os.getenv("MIN_NONNULL", "10")))
-        if not rating_cols:
-            raise ValueError(
-                "No rating columns detected. If ratings are text (e.g., Strongly Agree), we can map them to numbers."
-            )
-        ranks = rank_items_wide(df, rating_cols)
+    core = rank_core_courses(df)
+    electives = rank_electives(df)
 
-    # Save outputs
-    ranks.to_csv(outputs_dir / "rank_table.csv", index=False)
-    plot_rankings(ranks, outputs_dir / "rank_order.png", top_n=int(os.getenv("TOP_N", "20")))
+    core.to_csv(outputs_dir / "rank_table.csv", index=False)
+    electives.to_csv(outputs_dir / "elective_rank_table.csv", index=False)
 
-    # Reflection template (YOU must write your own reflection)
-    reflection_path = outputs_dir / "reflection.md"
-    if not reflection_path.exists():
-        reflection_path.write_text(
-            "# Reflection (write this in your own words)\n\n"
-            "## What changed from Project 1 to this workflow?\n- \n\n"
-            "## Where is the control now?\n- \n\n"
-            "## What would you do next if you had one more week?\n- \n\n"
-            "## One accounting application of this workflow (be specific)\n- \n",
-            encoding="utf-8"
-        )
+    top_n = int(os.getenv("TOP_N", "20"))
+    plot_core_rank(core, outputs_dir / "rank_order.png", top_n=top_n)
 
-    print("Done. Outputs written to:", outputs_dir)
+    print("Saved:", outputs_dir / "rank_table.csv")
+    print("Saved:", outputs_dir / "rank_order.png")
+    print("Saved:", outputs_dir / "elective_rank_table.csv")
+
 
 if __name__ == "__main__":
     main()
